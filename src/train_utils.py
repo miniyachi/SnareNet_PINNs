@@ -1,3 +1,4 @@
+import deepxde as dde
 import numpy as np
 import torch
 import torch.nn as nn
@@ -282,6 +283,7 @@ def set_random_seed(seed):
     random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
+    dde.config.set_random_seed(seed)
 
 """
 Helper function for generating data on a grid. 
