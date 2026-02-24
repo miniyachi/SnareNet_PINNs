@@ -2,9 +2,11 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import Adam, LBFGS
+from .models import SnareNetPINN
 from .opts.adam_lbfgs import Adam_LBFGS
 from .opts.adam_lbfgs_nncg import Adam_LBFGS_NNCG
 from .opts.adam_lbfgs_gd import Adam_LBFGS_GD
+from .snarenet_utils import transform_data_for_snarenet, predict_snarenet
 import random
 import re
 import wandb
@@ -27,10 +29,10 @@ OUTPUT:
 def get_pde(pde_name, pde_params_list, loss_name): 
     # determine loss type
     loss_options = {
-        "l1": {"res": nn.L1Loss(), "bc": nn.L1Loss(), "ic": nn.L1Loss()},
-        "mse": {"res": nn.MSELoss(), "bc": nn.MSELoss(), "ic": nn.MSELoss()},
-        "huber": {"res": nn.HuberLoss(), "bc": nn.HuberLoss(), "ic": nn.HuberLoss()},
-        "hybrid": {"res": nn.HuberLoss(), "bc": nn.MSELoss(), "ic": nn.MSELoss()}
+        "l1": {"res": nn.L1Loss(), "bc": nn.L1Loss(), "ic": nn.L1Loss(), "data": nn.L1Loss()},
+        "mse": {"res": nn.MSELoss(), "bc": nn.MSELoss(), "ic": nn.MSELoss(), "data": nn.MSELoss()},
+        "huber": {"res": nn.HuberLoss(), "bc": nn.HuberLoss(), "ic": nn.HuberLoss(), "data": nn.HuberLoss()},
+        "hybrid": {"res": nn.HuberLoss(), "bc": nn.MSELoss(), "ic": nn.MSELoss(), "data": nn.MSELoss()}
     }
     try: 
         loss_type = loss_options[loss_name]
@@ -48,7 +50,7 @@ def get_pde(pde_name, pde_params_list, loss_name):
         x_range = [0, 2 * np.pi]
         t_range = [0, 1]
 
-        def loss_func(x, t, pred): 
+        def loss_func(x, t, pred, target=None, data_indices=None): 
             x_res, x_left, x_upper, x_lower = x
             t_res, t_left, t_upper, t_lower = t
             outputs_res, outputs_left, outputs_upper, outputs_lower = pred
@@ -60,9 +62,20 @@ def get_pde(pde_name, pde_params_list, loss_name):
             loss_bc = loss_type["bc"](outputs_upper - outputs_lower, torch.zeros_like(outputs_upper))
             loss_ic = loss_type["ic"](outputs_left[:,0], torch.sin(x_left[:,0]))
 
-            # loss = loss_res + loss_bc + loss_ic
+            # Compute data loss if target is provided
+            if target is not None:
+                pred_all = torch.cat([outputs_res, outputs_left, outputs_upper, outputs_lower], dim=0)
+                # If data_indices provided, only use sampled points for data loss
+                if data_indices is not None:
+                    pred_sampled = pred_all[data_indices]
+                    target_sampled = target[data_indices]
+                    loss_data = loss_type["data"](pred_sampled, target_sampled)
+                else:
+                    loss_data = loss_type["data"](pred_all, target)
+            else:
+                loss_data = torch.tensor(0.0, device=outputs_res.device)
 
-            return loss_res, loss_bc, loss_ic
+            return loss_res, loss_bc, loss_ic, loss_data
 
     elif pde_name == "reaction_diffusion": 
         if not {"nu", "rho"} <= pde_coefs.keys(): 
@@ -71,7 +84,7 @@ def get_pde(pde_name, pde_params_list, loss_name):
         x_range = [0, 2 * np.pi]
         t_range = [0, 1]
 
-        def loss_func(x, t, pred): 
+        def loss_func(x, t, pred, target=None, data_indices=None): 
             x_res, x_left, x_upper, x_lower = x
             t_res, t_left, t_upper, t_lower = t
             outputs_res, outputs_left, outputs_upper, outputs_lower = pred
@@ -84,9 +97,20 @@ def get_pde(pde_name, pde_params_list, loss_name):
             loss_bc = loss_type["bc"](outputs_upper - outputs_lower, torch.zeros_like(outputs_upper))
             loss_ic = loss_type["ic"](outputs_left[:,0], torch.exp(-(1/2) * torch.square((x_left[:,0] - np.pi) / (np.pi / 4))))
 
-            # loss = loss_res + loss_bc + loss_ic
+            # Compute data loss if target is provided
+            if target is not None:
+                pred_all = torch.cat([outputs_res, outputs_left, outputs_upper, outputs_lower], dim=0)
+                # If data_indices provided, only use sampled points for data loss
+                if data_indices is not None:
+                    pred_sampled = pred_all[data_indices]
+                    target_sampled = target[data_indices]
+                    loss_data = loss_type["data"](pred_sampled, target_sampled)
+                else:
+                    loss_data = loss_type["data"](pred_all, target)
+            else:
+                loss_data = torch.tensor(0.0, device=outputs_res.device)
 
-            return loss_res, loss_bc, loss_ic
+            return loss_res, loss_bc, loss_ic, loss_data
 
     elif pde_name == "reaction": 
         if "rho" not in pde_coefs.keys(): 
@@ -95,7 +119,7 @@ def get_pde(pde_name, pde_params_list, loss_name):
         x_range = [0, 2 * np.pi]
         t_range = [0, 1]
 
-        def loss_func(x, t, pred): 
+        def loss_func(x, t, pred, target=None, data_indices=None): 
             x_res, x_left, x_upper, x_lower = x
             t_res, t_left, t_upper, t_lower = t
             outputs_res, outputs_left, outputs_upper, outputs_lower = pred
@@ -106,9 +130,20 @@ def get_pde(pde_name, pde_params_list, loss_name):
             loss_bc = loss_type["bc"](outputs_upper - outputs_lower, torch.zeros_like(outputs_upper))
             loss_ic = loss_type["ic"](outputs_left[:,0], torch.exp(-(1/2) * torch.square((x_left[:,0] - np.pi) / (np.pi / 4))))
 
-            # loss = loss_res + loss_bc + loss_ic
+            # Compute data loss if target is provided
+            if target is not None:
+                pred_all = torch.cat([outputs_res, outputs_left, outputs_upper, outputs_lower], dim=0)
+                # If data_indices provided, only use sampled points for data loss
+                if data_indices is not None:
+                    pred_sampled = pred_all[data_indices]
+                    target_sampled = target[data_indices]
+                    loss_data = loss_type["data"](pred_sampled, target_sampled)
+                else:
+                    loss_data = loss_type["data"](pred_all, target)
+            else:
+                loss_data = torch.tensor(0.0, device=outputs_res.device)
 
-            return loss_res, loss_bc, loss_ic
+            return loss_res, loss_bc, loss_ic, loss_data
 
     elif pde_name == "wave":
         if "beta" not in pde_coefs.keys():
@@ -117,7 +152,7 @@ def get_pde(pde_name, pde_params_list, loss_name):
         x_range = [0, 1]
         t_range = [0, 1]
 
-        def loss_func(x, t, pred):
+        def loss_func(x, t, pred, target=None, data_indices=None):
             x_res, x_left, x_upper, x_lower = x
             t_res, t_left, t_upper, t_lower = t
             outputs_res, outputs_left, outputs_upper, outputs_lower = pred
@@ -137,7 +172,20 @@ def get_pde(pde_name, pde_params_list, loss_name):
 
             loss_ic = loss_ic_1 + loss_ic_2
 
-            return loss_res, loss_bc, loss_ic
+            # Compute data loss if target is provided
+            if target is not None:
+                pred_all = torch.cat([outputs_res, outputs_left, outputs_upper, outputs_lower], dim=0)
+                # If data_indices provided, only use sampled points for data loss
+                if data_indices is not None:
+                    pred_sampled = pred_all[data_indices]
+                    target_sampled = target[data_indices]
+                    loss_data = loss_type["data"](pred_sampled, target_sampled)
+                else:
+                    loss_data = loss_type["data"](pred_all, target)
+            else:
+                loss_data = torch.tensor(0.0, device=outputs_res.device)
+
+            return loss_res, loss_bc, loss_ic, loss_data
 
     else: 
         raise RuntimeError("{} is not a valid PDE name.".format(pde_name))
@@ -290,16 +338,15 @@ def get_data(x_range, t_range, x_num, t_num, random=False, num_res_samples=1e4, 
         t_res = t_mesh.reshape(-1,1)
         data_params["res_idx"] = np.arange((x_num - 2) * (t_num - 1))
 
-    # move data to target device
-    if device != 'cpu': 
-        x_left = torch.tensor(x_left, dtype=torch.float32, requires_grad=True).to(device)
-        t_left = torch.tensor(t_left, dtype=torch.float32, requires_grad=True).to(device)
-        x_upper = torch.tensor(x_upper, dtype=torch.float32, requires_grad=True).to(device)
-        t_upper = torch.tensor(t_upper, dtype=torch.float32, requires_grad=True).to(device)
-        x_lower = torch.tensor(x_lower, dtype=torch.float32, requires_grad=True).to(device)
-        t_lower = torch.tensor(t_lower, dtype=torch.float32, requires_grad=True).to(device)
-        x_res = torch.tensor(x_res, dtype=torch.float32, requires_grad=True).to(device)
-        t_res = torch.tensor(t_res, dtype=torch.float32, requires_grad=True).to(device)
+    # move data to target device (always convert to torch tensors)
+    x_left = torch.tensor(x_left, dtype=torch.float32, requires_grad=True).to(device)
+    t_left = torch.tensor(t_left, dtype=torch.float32, requires_grad=True).to(device)
+    x_upper = torch.tensor(x_upper, dtype=torch.float32, requires_grad=True).to(device)
+    t_upper = torch.tensor(t_upper, dtype=torch.float32, requires_grad=True).to(device)
+    x_lower = torch.tensor(x_lower, dtype=torch.float32, requires_grad=True).to(device)
+    t_lower = torch.tensor(t_lower, dtype=torch.float32, requires_grad=True).to(device)
+    x_res = torch.tensor(x_res, dtype=torch.float32, requires_grad=True).to(device)
+    t_res = torch.tensor(t_res, dtype=torch.float32, requires_grad=True).to(device)
 
     # form tuples
     x = (x_res, x_left, x_upper, x_lower)
@@ -552,7 +599,10 @@ def train(model,
           n_t,
           n_res,
           num_epochs,
-          device):
+          device,
+          net_modifier_fn=None,
+          data_loss_weight=0.0,
+          num_data_samples=None):
     model.apply(init_weights)
 
     x_range, t_range, loss_func, pde_coefs = get_pde(pde_name, pde_params, loss_name)
@@ -561,25 +611,69 @@ def train(model,
 
     logging_times = get_log_times(opt, LOG_FREQ, num_epochs)
 
+    # Generate data
     x, t, data_params = get_data(x_range, t_range, n_x, n_t, random=True, num_res_samples=n_res, device=device)
     wandb.log({'x': x, 't': t}) # Log training set
-
-    loss_res, loss_bc, loss_ic = loss_func(x, t, predict(x, t, model))
-    loss = loss_res + loss_bc + loss_ic
-    wandb.log({'loss': loss.item(),
-            'loss_res': loss_res.item(),
-            'loss_bc': loss_bc.item(),
-            'loss_ic': loss_ic.item()})
+    
+    # Compute target solutions for data loss
+    data_indices = None
+    if data_loss_weight > 0:
+        target_solutions = get_ref_solutions(pde_name, pde_coefs, x, t, data_params)
+        target_solutions = torch.tensor(target_solutions, dtype=torch.float32, device=device)
+        
+        # Sample random subset if num_data_samples is specified
+        total_points = target_solutions.shape[0]
+        if num_data_samples is not None and num_data_samples < total_points:
+            data_indices = torch.randperm(total_points, device=device)[:num_data_samples]
+            print(f"Using {num_data_samples} randomly sampled data points out of {total_points} total points for data loss")
+        else:
+            print(f"Using all {total_points} data points for data loss")
+    else:
+        target_solutions = None
+    
+    # Detect model type and prepare SnareNet data if needed
+    is_snarenet = isinstance(model, SnareNetPINN)
+    if is_snarenet:
+        # Transform data to SnareNet format (paired inputs)
+        x1, x2, t_paired, indices = transform_data_for_snarenet(x, t)
+    
+    # Initial loss
+    if is_snarenet:
+        if net_modifier_fn is not None:
+            model = net_modifier_fn(model, 0)
+        preds = predict_snarenet(x1, x2, t_paired, model, indices)
+    else:
+        preds = predict(x, t, model)
+    loss_res, loss_bc, loss_ic, loss_data = loss_func(x, t, preds, target_solutions, data_indices)
+    loss = loss_res + loss_bc + loss_ic + data_loss_weight * loss_data
+    
+    log_dict = {
+        'loss': loss.item(),
+        'loss_res': loss_res.item(),
+        'loss_bc': loss_bc.item(),
+        'loss_ic': loss_ic.item(),
+        'loss_data': loss_data.item()
+    }
+    if is_snarenet:
+        log_dict['newton_iters'] = model.get_iter_taken()
+    wandb.log(log_dict)
     
     for i in range(num_epochs):
+        # Modify network if needed (e.g., enable/disable projection for soft training)
+        if net_modifier_fn is not None:
+            model = net_modifier_fn(model, i)
+        
         model.train()
 
         # Update the preconditioner for NysNewtonCG
         if isinstance(opt, Adam_LBFGS_NNCG) and i >= opt.switch_epoch2 and i % opt.precond_update_freq == 0:
             opt.zero_grad()
-            outputs = predict(x, t, model)
-            loss_res, loss_bc, loss_ic = loss_func(x, t, outputs)
-            loss = loss_res + loss_bc + loss_ic
+            if is_snarenet:
+                outputs = predict_snarenet(x1, x2, t_paired, model, indices)
+            else:
+                outputs = predict(x, t, model)
+            loss_res, loss_bc, loss_ic, loss_data = loss_func(x, t, outputs, target_solutions, data_indices)
+            loss = loss_res + loss_bc + loss_ic + data_loss_weight * loss_data
             grad_tuple = torch.autograd.grad(
                 loss, model.parameters(), create_graph=True)
             opt.nncg.update_preconditioner(grad_tuple)
@@ -588,17 +682,23 @@ def train(model,
         if isinstance(opt, (Adam_LBFGS_NNCG, Adam_LBFGS_GD)) and i >= opt.switch_epoch2:
             def closure():
                 opt.zero_grad()
-                outputs = predict(x, t, model)
-                loss_res, loss_bc, loss_ic = loss_func(x, t, outputs)
-                loss = loss_res + loss_bc + loss_ic
+                if is_snarenet:
+                    outputs = predict_snarenet(x1, x2, t_paired, model, indices)
+                else:
+                    outputs = predict(x, t, model)
+                loss_res, loss_bc, loss_ic, loss_data = loss_func(x, t, outputs, target_solutions, data_indices)
+                loss = loss_res + loss_bc + loss_ic + data_loss_weight * loss_data
                 grad_tuple = torch.autograd.grad(loss, model.parameters(), create_graph=True)
                 return loss, grad_tuple
         else:
             def closure():
                 opt.zero_grad()
-                outputs = predict(x, t, model)
-                loss_res, loss_bc, loss_ic = loss_func(x, t, outputs)
-                loss = loss_res + loss_bc + loss_ic
+                if is_snarenet:
+                    outputs = predict_snarenet(x1, x2, t_paired, model, indices)
+                else:
+                    outputs = predict(x, t, model)
+                loss_res, loss_bc, loss_ic, loss_data = loss_func(x, t, outputs, target_solutions, data_indices)
+                loss = loss_res + loss_bc + loss_ic + data_loss_weight * loss_data
                 loss.backward()
                 return loss
 
@@ -610,8 +710,12 @@ def train(model,
         # record model parameters and loss
         model.eval()
         if i in logging_times:
-            loss_res, loss_bc, loss_ic = loss_func(x, t, predict(x, t, model))
-            loss = loss_res + loss_bc + loss_ic
+            if is_snarenet:
+                preds = predict_snarenet(x1, x2, t_paired, model, indices)
+            else:
+                preds = predict(x, t, model)
+            loss_res, loss_bc, loss_ic, loss_data = loss_func(x, t, preds, target_solutions, data_indices)
+            loss = loss_res + loss_bc + loss_ic + data_loss_weight * loss_data
 
             # Compute the gradient norm of the full objective function
             # NOTE: This will not work if we do minibatching
@@ -620,25 +724,39 @@ def train(model,
             else:
                 grad_norm = 0
                 for p in model.parameters():
-                    grad_norm += p.grad.norm().item() ** 2
+                    if p.grad is not None:
+                        grad_norm += p.grad.norm().item() ** 2
                 grad_norm = grad_norm ** 0.5
 
-            if isinstance(opt, Adam_LBFGS_NNCG) and i >= opt.switch_epoch2:
-                wandb.log({'step_size': opt.nncg.state_dict()['state'][0]['t']},
-                            commit=False)
-            elif isinstance(opt, Adam_LBFGS_GD) and i >= opt.switch_epoch2:
-                wandb.log({'step_size': opt.gd.state_dict()['state'][0]['t']},
-                            commit=False)
-
-            wandb.log({'loss': loss.item(),
+            log_dict = {
+                'loss': loss.item(),
                 'loss_res': loss_res.item(),
                 'loss_bc': loss_bc.item(),
                 'loss_ic': loss_ic.item(),
-                'grad_norm': grad_norm})
+                'loss_data': loss_data.item(),
+                'grad_norm': grad_norm
+            }
+            
+            if isinstance(opt, Adam_LBFGS_NNCG) and i >= opt.switch_epoch2:
+                log_dict['step_size'] = opt.nncg.state_dict()['state'][0]['t']
+            elif isinstance(opt, Adam_LBFGS_GD) and i >= opt.switch_epoch2:
+                log_dict['step_size'] = opt.gd.state_dict()['state'][0]['t']
+            
+            if is_snarenet:
+                log_dict['newton_iters'] = model.get_iter_taken()
+
+            wandb.log(log_dict)
     
     # evaluate errors
-    with torch.no_grad():
-        predictions = torch.vstack(predict(x, t, model)).cpu().detach().numpy()
+    # Note: SnareNet needs gradients for forward pass (to compute derivatives in forward_augmented)
+    if is_snarenet:
+        preds = predict_snarenet(x1, x2, t_paired, model, indices)
+        predictions = torch.vstack(preds).cpu().detach().numpy()
+    else:
+        with torch.no_grad():
+            preds = predict(x, t, model)
+            predictions = torch.vstack(preds).cpu().detach().numpy()
+    
     targets = get_ref_solutions(pde_name, pde_coefs, x, t, data_params)
     train_l1re = l1_relative_error(predictions, targets)
     train_l2re = l2_relative_error(predictions, targets)
@@ -647,8 +765,19 @@ def train(model,
     n_x_test = int((n_x - 1) / 2) + 1
     n_t_test = n_t
     x_test, t_test, data_params_test = get_data(x_range, t_range, n_x_test, n_t_test, random=False, device=device)
-    with torch.no_grad():
-        predictions = torch.vstack(predict(x_test, t_test, model)).cpu().detach().numpy()
+    
+    if is_snarenet:
+        x1_test, x2_test, t_test_paired, indices_test = transform_data_for_snarenet(x_test, t_test)
+    
+    # Note: SnareNet needs gradients for forward pass (to compute derivatives in forward_augmented)
+    if is_snarenet:
+        preds_test = predict_snarenet(x1_test, x2_test, t_test_paired, model, indices_test)
+        predictions = torch.vstack(preds_test).cpu().detach().numpy()
+    else:
+        with torch.no_grad():
+            preds_test = predict(x_test, t_test, model)
+            predictions = torch.vstack(preds_test).cpu().detach().numpy()
+    
     targets = get_ref_solutions(pde_name, pde_coefs, x_test, t_test, data_params_test)
     test_l1re = l1_relative_error(predictions, targets)
     test_l2re = l2_relative_error(predictions, targets)

@@ -4,7 +4,11 @@ __pycache__/
 *.apng
 wandb/
 *temp/
+checkpoints/
+wandb_checkpoints/
 .DS_Store
 ._*
 Thumbs.db
 *.pyc
+
+figs/*
